@@ -454,6 +454,78 @@ struct file_load_data_st {
 
 static int luna_store_handle_load_result(const OSSL_PARAM params[], struct file_load_data_st *data);
 
+#ifdef LUNA_OQS
+/*
+ * Replace the ECX key in *v with a provider-native one.
+ *
+ * A legacy EVP_PKEY (EVP_PKEY_assign) carries the libcrypto ECX ASN1 method;
+ * for ED25519/ED448 its ctrl rejects ASN1_PKEY_CTRL_CMS_SIGN, so
+ * CMS_add1_signer fails with "not supported for this key type"; OpenSSL 3
+ * signs CMS with EdDSA only for provider keys. So hand a copy of |ecx|
+ * (public key already fixed from the hsm) back to the load callback as an
+ * object reference: no export_object is offered, so libcrypto loads it
+ * through our keymgmt (ecx_load), which keeps the public key as is.
+ *
+ * Only types that have our keymgmt are tried: X25519/X448 are registered with
+ * LUNA_KEYEXCH only (lunaProvider.c), and a failed load would leave its fetch
+ * errors on the caller's error queue although the legacy key then loads.
+ *
+ * Returns 1 when *v holds the new key, 0 with *v and |ecx| left untouched.
+ */
+static int luna_store_reload_ecx(struct file_load_data_st *data,
+                                 OSSL_STORE_INFO **v, int pktype,
+                                 const ECX_KEY *ecx)
+{
+    OSSL_STORE_INFO *info_old = *v;
+    int object_type = OSSL_OBJECT_PKEY;
+    char *data_type = NULL;
+    OSSL_PARAM params[4];
+    ECX_KEY *ref = NULL;
+
+    switch (pktype) {
+    case EVP_PKEY_ED25519:
+        data_type = "ED25519";
+        break;
+    case EVP_PKEY_ED448:
+        data_type = "ED448";
+        break;
+#ifdef LUNA_KEYEXCH
+    case EVP_PKEY_X25519:
+        data_type = "X25519";
+        break;
+    case EVP_PKEY_X448:
+        data_type = "X448";
+        break;
+#endif /* LUNA_KEYEXCH */
+    default:
+        return 0;
+    }
+
+    /* ecx_load() takes this over and sets it to NULL */
+    ref = ossl_ecx_key_dup(ecx, OSSL_KEYMGMT_SELECT_KEYPAIR);
+    if (ref == NULL)
+        return 0;
+
+    params[0] = OSSL_PARAM_construct_int(OSSL_OBJECT_PARAM_TYPE, &object_type);
+    params[1] = OSSL_PARAM_construct_utf8_string(OSSL_OBJECT_PARAM_DATA_TYPE,
+                                                 data_type, 0);
+    params[2] = OSSL_PARAM_construct_octet_string(OSSL_OBJECT_PARAM_REFERENCE,
+                                                  &ref, sizeof(ref));
+    params[3] = OSSL_PARAM_construct_end();
+
+    /* the load result callback only fills an empty *v */
+    *v = NULL;
+    if (data->object_cb(params, data->object_cbarg) == 0 || *v == NULL
+            || OSSL_STORE_INFO_get_type(*v) != OSSL_STORE_INFO_PKEY) {
+        /* a non-PKEY result is not freed, like the old info (see FIXME below) */
+        *v = info_old;
+        ossl_ecx_key_free(ref); /* NULL if ecx_load() took it */
+        return 0;
+    }
+    return 1;
+}
+#endif /* LUNA_OQS */
+
 static int file_load_construct(OSSL_DECODER_INSTANCE *decoder_inst,
                                const OSSL_PARAM *params, void *construct_data)
 {
@@ -516,19 +588,29 @@ static int file_load_construct(OSSL_DECODER_INSTANCE *decoder_inst,
                 (void)luna_prov_ecx_fix_public((ECX_KEY *)ecx);
                 LUNA_PRINTF(("luna_prov_ecx_fix_public... ok.\n"));
 
-                /* NOTE: We must create a new EVP_PKEY that is associated with our provider.
-                 * Otherwise, the ecx_backend will clobber the public key using the EVP_PKEY
-                 * that it created.
-                 *
-                 * Note the gem engine does a similar thing when loading keys in openssl3.
-                 * I know this is very non-intuitive - but "that's just the way it is".
-                 */
-                EVP_PKEY *pk_new = EVP_PKEY_new();
-                LUNA_ASSERT(pk_new != NULL);
-                LUNA_ASSERT(EVP_PKEY_assign(pk_new, pktype, (ECX_KEY *)ecx) > 0);
-                OSSL_STORE_INFO *info_new = OSSL_STORE_INFO_new_PKEY(pk_new);
-                LUNA_ASSERT(info_new != NULL);
-                *v = info_new;
+                if (luna_store_reload_ecx(data, v, pktype, ecx)) {
+                    /* *v now holds a provider-native copy; drop our reference */
+                    ossl_ecx_key_free((ECX_KEY *)ecx);
+                    LUNA_PRINTF(("luna_store_reload_ecx... ok.\n"));
+                } else {
+                    /* NOTE: We must create a new EVP_PKEY that is associated with our provider.
+                     * Otherwise, the ecx_backend will clobber the public key using the EVP_PKEY
+                     * that it created.
+                     *
+                     * Note the gem engine does a similar thing when loading keys in openssl3.
+                     * I know this is very non-intuitive - but "that's just the way it is".
+                     *
+                     * NOTE: EVP_PKEY_assign() makes a legacy key, which `openssl cms -sign`
+                     * rejects for ED25519/ED448; keys that our keymgmt can load take
+                     * luna_store_reload_ecx() above and only fall back to this if it fails.
+                     */
+                    EVP_PKEY *pk_new = EVP_PKEY_new();
+                    LUNA_ASSERT(pk_new != NULL);
+                    LUNA_ASSERT(EVP_PKEY_assign(pk_new, pktype, (ECX_KEY *)ecx) > 0);
+                    OSSL_STORE_INFO *info_new = OSSL_STORE_INFO_new_PKEY(pk_new);
+                    LUNA_ASSERT(info_new != NULL);
+                    *v = info_new;
+                }
 
                 /* free the old store info */
                 //FIXME:OSSL_STORE_INFO_free(info);
